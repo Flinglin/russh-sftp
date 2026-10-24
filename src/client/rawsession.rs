@@ -253,14 +253,13 @@ impl RawSftpSession {
             version: None,
             requests: req_map.clone(),
         };
-        let timeout = AtomicU64::new(cfg.request_timeout_secs);
-        let transport = run_session(stream, inner, req_map, cfg);
+        let transport = run_session(stream, inner, req_map, cfg.max_outbound_inflight_bytes);
 
         Self {
             transport,
             next_req_id: AtomicU32::new(1),
             handles: AtomicU64::new(0),
-            timeout,
+            timeout: AtomicU64::new(cfg.request_timeout_secs),
             limits: Limits::default(),
         }
     }
@@ -283,14 +282,19 @@ impl RawSftpSession {
             version: None,
             requests: req_map.clone(),
         };
-        let timeout = AtomicU64::new(cfg.request_timeout_secs);
-        let transport = run_owned_session(reader, writer, inner, req_map, cfg);
+        let transport = run_owned_session(
+            reader,
+            writer,
+            inner,
+            req_map,
+            cfg.max_outbound_inflight_bytes,
+        );
 
         Self {
             transport,
             next_req_id: AtomicU32::new(1),
             handles: AtomicU64::new(0),
-            timeout,
+            timeout: AtomicU64::new(cfg.request_timeout_secs),
             limits: Limits::default(),
         }
     }

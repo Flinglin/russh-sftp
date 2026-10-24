@@ -18,7 +18,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{error::Error, process_handler, runtime, Handler, OwnedSftpWriter};
-use crate::{client::Config, error::Error as ProtocolError, protocol::Packet};
+use crate::{error::Error as ProtocolError, protocol::Packet};
 
 pub(crate) type RequestKey = Option<u32>;
 pub(crate) type SftpResult<T> = Result<T, Error>;
@@ -535,14 +535,20 @@ pub(crate) fn run_session<S, H>(
     stream: S,
     handler: H,
     requests: Arc<SharedRequests>,
-    cfg: Config,
+    max_inflight_bytes: usize,
 ) -> SessionTransport
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler + Send + 'static,
 {
     let (reader, writer) = io::split(stream);
-    run_owned_session(reader, AsyncWriteOwned(writer), handler, requests, cfg)
+    run_owned_session(
+        reader,
+        AsyncWriteOwned(writer),
+        handler,
+        requests,
+        max_inflight_bytes,
+    )
 }
 
 pub(crate) fn run_owned_session<R, W, H>(
@@ -550,14 +556,14 @@ pub(crate) fn run_owned_session<R, W, H>(
     mut writer: W,
     mut handler: H,
     requests: Arc<SharedRequests>,
-    cfg: Config,
+    max_inflight_bytes: usize,
 ) -> SessionTransport
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: OwnedSftpWriter,
     H: Handler + Send + 'static,
 {
-    let queue_capacity = cfg.max_outbound_inflight_bytes.max(1);
+    let queue_capacity = max_inflight_bytes.max(1);
     // This queue, byte semaphore, request registry, and cancellation token are
     // one ownership unit tied to the lifetime of a single live SFTP session.
     let (sender, mut receiver) = mpsc::channel(queue_capacity);
@@ -579,7 +585,7 @@ where
             select! {
                 biased;
                 _ = read_transport.cancellation.cancelled() => break,
-                result = process_handler(&mut reader, &mut handler,cfg.max_packet_len) => {
+                result = process_handler(&mut reader, &mut handler) => {
                     match result {
                         Ok(()) => {}
                         Err(ProtocolError::BadMessage(error)) => warn!("{error}"),
@@ -816,7 +822,7 @@ mod tests {
             },
             NoopHandler,
             requests,
-            Config::default(),
+            16,
         );
         let first_frame = Bytes::from_static(b"first");
         let first = transport

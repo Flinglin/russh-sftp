@@ -255,22 +255,7 @@ impl SerializeSeq for &mut Serializer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use bytes::Buf;
 
-    use super::*;
-
-    #[test]
-    fn packet_length_includes_type_and_payload() {
-        let mut packet = to_packet_bytes(42, &123_u32).unwrap();
-
-        assert_eq!(packet.get_u32(), 5);
-        assert_eq!(packet.get_u8(), 42);
-        assert_eq!(packet.get_u32(), 123);
-        assert!(!packet.has_remaining());
-    }
-}
 
 impl SerializeMap for &mut Serializer {
     type Ok = ();
@@ -372,5 +357,22 @@ impl SerializeTupleVariant for &mut Serializer {
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Buf;
+
+    use super::*;
+
+    #[test]
+    fn packet_length_includes_type_and_payload() {
+        let mut packet = to_packet_bytes(42, &123_u32).unwrap();
+
+        assert_eq!(packet.get_u32(), 5);
+        assert_eq!(packet.get_u8(), 42);
+        assert_eq!(packet.get_u32(), 123);
+        assert!(!packet.has_remaining());
     }
 }

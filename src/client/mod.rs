@@ -85,30 +85,20 @@ where
     }
 }
 
-async fn process_handler<S, H>(
-    stream: &mut S,
-    handler: &mut H,
-    max_processed_packet_len: u32,
-) -> Result<(), Error>
+async fn process_handler<S, H>(stream: &mut S, handler: &mut H) -> Result<(), Error>
 where
     S: AsyncRead + Unpin,
     H: Handler + Send,
 {
-    let mut bytes = read_packet(stream, max_processed_packet_len).await?;
+    let mut bytes = read_packet(stream, u32::MAX).await?;
     Ok(execute_handler(&mut bytes, handler).await?)
 }
-pub fn run<S, H>(stream: S, handler: H) -> mpsc::UnboundedSender<Bytes>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    H: Handler + Send + 'static,
-{
-    run_with_config(stream, handler, Config::default())
-}
+
 /// Runs a low-level compatibility handler for non-standard implementations.
 ///
 /// [`RawSftpSession`] and [`SftpSession`] do not use this untracked sender;
 /// their live-session transport owns a byte-bounded queue and request phases.
-pub fn run_with_config<S, H>(stream: S, mut handler: H, cfg: Config) -> mpsc::UnboundedSender<Bytes>
+pub fn run<S, H>(stream: S, mut handler: H) -> mpsc::UnboundedSender<Bytes>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler + Send + 'static,
@@ -122,7 +112,7 @@ where
         runtime::spawn(async move {
             loop {
                 select! {
-                    result = process_handler(&mut rd, &mut handler,cfg.max_packet_len) => {
+                    result = process_handler(&mut rd, &mut handler) => {
                         match result {
                             Err(Error::UnexpectedEof) => break,
                             Err(err) => warn!("{}", err),
