@@ -33,8 +33,7 @@ impl File {
 
     /// Get formed longname
     pub fn longname(&self) -> String {
-        const SIX_MONTHS: i64 = 15_778_476;
-
+        const SIX_MONTHS: i64 = 15_7787_476;
         let directory = if self.attrs.is_dir() { "d" } else { "-" };
         let permissions = self.attrs.permissions().to_string();
 
@@ -44,8 +43,8 @@ impl File {
         let datetime = DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_secs(mtime as u64));
         let now = Utc::now().timestamp();
         let age = now - (mtime as i64);
-        let delayed = if !(0..=SIX_MONTHS).contains(&age) {
-            datetime.format("%b %e  %Y").to_string()
+        let delayed = if age > SIX_MONTHS || age < 0 {
+            datetime.format("%b %e %Y").to_string()
         } else {
             datetime.format("%b %e %H:%M").to_string()
         };

@@ -4,12 +4,14 @@ mod handler;
 pub mod rawsession;
 pub(crate) mod runtime;
 mod session;
+mod transport;
 
 pub use handler::Handler;
 pub use rawsession::RawSftpSession;
 pub use session::SftpSession;
 
 use bytes::Bytes;
+use std::future::Future;
 use tokio::{
     io::{self, AsyncRead, AsyncWrite, AsyncWriteExt},
     select,
@@ -28,30 +30,41 @@ macro_rules! into_wrap {
     };
 }
 
+/// Default per-session budget for queued and sent-but-unacknowledged frames.
+pub const DEFAULT_MAX_OUTBOUND_INFLIGHT_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Maximum size of a single packet in bytes. Default: 256 KiB.
     pub max_packet_len: u32,
-    /// Maximum number of concurrent in-flight read requests. Default: 16.
-    pub max_concurrent_reads: usize,
-    /// Maximum number of concurrent in-flight write requests. Default: 16.
+    /// Maximum number of concurrent in-flight write requests. Default: 8.
     pub max_concurrent_writes: usize,
-    /// Preferred maximum size of a framed write packet. Default: 32 KiB.
-    pub max_write_packet_len: u32,
     /// Timeout in seconds for each request. Default: 10.
     pub request_timeout_secs: u64,
+    /// Maximum queued and sent-but-unacknowledged frame bytes per live
+    /// SFTP session. Default: 16 MiB.
+    pub max_outbound_inflight_bytes: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             max_packet_len: 262144,
-            max_concurrent_reads: 16,
-            max_concurrent_writes: 16,
-            max_write_packet_len: 32768,
+            max_concurrent_writes: 8,
             request_timeout_secs: 10,
+            max_outbound_inflight_bytes: DEFAULT_MAX_OUTBOUND_INFLIGHT_BYTES,
         }
     }
+}
+
+/// Transport contract for handing an owned SFTP frame to an underlying stream.
+///
+/// Implementations must treat a successful `write_owned` call as accepted by
+/// their transport, not as an SFTP acknowledgement from the remote server.
+pub trait OwnedSftpWriter: Send + 'static {
+    fn write_owned(&mut self, data: Bytes) -> impl Future<Output = io::Result<()>> + Send;
+
+    fn shutdown(&mut self) -> impl Future<Output = io::Result<()>> + Send;
 }
 
 async fn execute_handler<H>(bytes: &mut Bytes, handler: &mut H) -> Result<(), error::Error>
@@ -72,17 +85,18 @@ where
     }
 }
 
-async fn process_handler<S, H>(stream: &mut S, handler: &mut H, cfg: &Config) -> Result<(), Error>
+async fn process_handler<S, H>(
+    stream: &mut S,
+    handler: &mut H,
+    max_processed_packet_len: u32,
+) -> Result<(), Error>
 where
     S: AsyncRead + Unpin,
     H: Handler + Send,
 {
-    let mut bytes = read_packet(stream, cfg.max_packet_len).await?;
+    let mut bytes = read_packet(stream, max_processed_packet_len).await?;
     Ok(execute_handler(&mut bytes, handler).await?)
 }
-
-/// Run processing stream as SFTP client. Is a simple handler of incoming
-/// and outgoing packets. Can be used for non-standard implementations
 pub fn run<S, H>(stream: S, handler: H) -> mpsc::UnboundedSender<Bytes>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -90,8 +104,10 @@ where
 {
     run_with_config(stream, handler, Config::default())
 }
-
-/// Run processing stream as SFTP client with custom configuration
+/// Runs a low-level compatibility handler for non-standard implementations.
+///
+/// [`RawSftpSession`] and [`SftpSession`] do not use this untracked sender;
+/// their live-session transport owns a byte-bounded queue and request phases.
 pub fn run_with_config<S, H>(stream: S, mut handler: H, cfg: Config) -> mpsc::UnboundedSender<Bytes>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -106,13 +122,10 @@ where
         runtime::spawn(async move {
             loop {
                 select! {
-                    result = process_handler(&mut rd, &mut handler, &cfg) => {
+                    result = process_handler(&mut rd, &mut handler,cfg.max_packet_len) => {
                         match result {
                             Err(Error::UnexpectedEof) => break,
-                            Err(err) => {
-                                warn!("{}", err);
-                                break;
-                            },
+                            Err(err) => warn!("{}", err),
                             Ok(_) => (),
                         }
                     },
@@ -128,17 +141,13 @@ where
     runtime::spawn(async move {
         loop {
             select! {
-                data = rx.recv() => {
-                    let Some(data) = data else { break; };
+                Some(data) = rx.recv() => {
                     if data.is_empty() {
                         let _ = wr.shutdown().await;
                         break;
                     }
 
-                    if let Err(error) = wr.write_all(&data[..]).await {
-                        warn!("{}", error);
-                        break;
-                    }
+                    let _ = wr.write_all(&data[..]).await;
                 },
                 _ = wc.cancelled() => break,
             }

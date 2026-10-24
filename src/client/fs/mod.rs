@@ -9,5 +9,9 @@ mod file;
 use crate::protocol::FileAttributes;
 
 pub use dir::{DirEntry, ReadDir};
-pub use file::File;
+pub use file::{
+    File, FileDownloadParts, FileUploadParts, PipelinedDownloaderSnapshot, PipelinedFileDownloader,
+    PipelinedFileUploader, PipelinedReadChunk, PipelinedUploaderSnapshot, SftpWindowShrinkReason,
+    SftpWindowSnapshot,
+};
 pub type Metadata = FileAttributes;

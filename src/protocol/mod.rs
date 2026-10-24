@@ -27,11 +27,10 @@ mod symlink;
 mod version;
 mod write;
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{de, error::Error, ser};
 
-pub(crate) use self::write::WriteRef;
 pub use self::{
     attrs::Attrs,
     close::Close,
@@ -71,8 +70,8 @@ const SSH_FXP_INIT: u8 = 1;
 const SSH_FXP_VERSION: u8 = 2;
 const SSH_FXP_OPEN: u8 = 3;
 const SSH_FXP_CLOSE: u8 = 4;
-const SSH_FXP_READ: u8 = 5;
-const SSH_FXP_WRITE: u8 = 6;
+pub(crate) const SSH_FXP_READ: u8 = 5;
+pub(crate) const SSH_FXP_WRITE: u8 = 6;
 const SSH_FXP_LSTAT: u8 = 7;
 const SSH_FXP_FSTAT: u8 = 8;
 const SSH_FXP_SETSTAT: u8 = 9;
@@ -96,6 +95,52 @@ const SSH_FXP_ATTRS: u8 = 105;
 
 const SSH_FXP_EXTENDED: u8 = 200;
 const SSH_FXP_EXTENDED_REPLY: u8 = 201;
+
+fn checked_packet_len(parts: &[usize]) -> Result<u32, Error> {
+    let mut len = 0usize;
+    for part in parts {
+        len = len
+            .checked_add(*part)
+            .ok_or_else(|| Error::BadMessage("packet length overflow".to_owned()))?;
+    }
+    u32::try_from(len).map_err(|_| Error::BadMessage("packet too large".to_owned()))
+}
+
+fn decode_data_packet(bytes: &mut Bytes) -> Result<Data, Error> {
+    let id = bytes.try_get_u32()?;
+    let len = bytes.try_get_u32()? as usize;
+    if bytes.remaining() < len {
+        return Err(Error::BadMessage("no remaining for data".to_owned()));
+    }
+
+    // Keep SFTP DATA payload as a Bytes slice so bulk downloads can forward it
+    // to callers without first copying the packet body into a Vec.
+    Ok(Data {
+        id,
+        data: bytes.copy_to_bytes(len),
+    })
+}
+
+fn encode_data_packet(data: Data) -> Result<Bytes, Error> {
+    let data_len = u32::try_from(data.data.len())
+        .map_err(|_| Error::BadMessage("data too large".to_owned()))?;
+    let packet_len = checked_packet_len(&[
+        1,
+        std::mem::size_of::<u32>(),
+        std::mem::size_of::<u32>(),
+        data.data.len(),
+    ])?;
+
+    // Match the generic SFTP frame format while avoiding a separate DATA
+    // payload allocation for Bytes-backed packet bodies.
+    let mut bytes = BytesMut::with_capacity(std::mem::size_of::<u32>() + packet_len as usize);
+    bytes.put_u32(packet_len);
+    bytes.put_u8(SSH_FXP_DATA);
+    bytes.put_u32(data.id);
+    bytes.put_u32(data_len);
+    bytes.put_slice(&data.data);
+    Ok(bytes.freeze())
+}
 
 pub(crate) trait RequestId: Sized {
     fn get_request_id(&self) -> u32;
@@ -198,7 +243,6 @@ impl Packet {
 impl TryFrom<&mut Bytes> for Packet {
     type Error = Error;
 
-    /// Decodes type and payload after the stream reader has consumed the length.
     fn try_from(bytes: &mut Bytes) -> Result<Self, Self::Error> {
         let r#type = bytes.try_get_u8()?;
         debug!("packet type {}", r#type);
@@ -226,7 +270,7 @@ impl TryFrom<&mut Bytes> for Packet {
             SSH_FXP_SYMLINK => Self::Symlink(de::from_bytes(bytes)?),
             SSH_FXP_STATUS => Self::Status(de::from_bytes(bytes)?),
             SSH_FXP_HANDLE => Self::Handle(de::from_bytes(bytes)?),
-            SSH_FXP_DATA => Self::Data(de::from_bytes(bytes)?),
+            SSH_FXP_DATA => Self::Data(decode_data_packet(bytes)?),
             SSH_FXP_NAME => Self::Name(de::from_bytes(bytes)?),
             SSH_FXP_ATTRS => Self::Attrs(de::from_bytes(bytes)?),
             SSH_FXP_EXTENDED => Self::Extended(de::from_bytes(bytes)?),
@@ -266,11 +310,36 @@ impl TryFrom<Packet> for Bytes {
             Packet::Symlink(packet) => ser::to_packet_bytes(SSH_FXP_SYMLINK, &packet),
             Packet::Status(packet) => ser::to_packet_bytes(SSH_FXP_STATUS, &packet),
             Packet::Handle(packet) => ser::to_packet_bytes(SSH_FXP_HANDLE, &packet),
-            Packet::Data(packet) => ser::to_packet_bytes(SSH_FXP_DATA, &packet),
+            Packet::Data(packet) => encode_data_packet(packet),
             Packet::Name(packet) => ser::to_packet_bytes(SSH_FXP_NAME, &packet),
             Packet::Attrs(packet) => ser::to_packet_bytes(SSH_FXP_ATTRS, &packet),
             Packet::Extended(packet) => ser::to_packet_bytes(SSH_FXP_EXTENDED, &packet),
             Packet::ExtendedReply(packet) => ser::to_packet_bytes(SSH_FXP_EXTENDED_REPLY, &packet),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_packet_round_trips_bytes_payload() {
+        let payload = Bytes::from_static(b"download-payload");
+        let encoded = Bytes::try_from(Packet::Data(Data {
+            id: 7,
+            data: payload.clone(),
+        }))
+        .expect("data packet encodes");
+        let mut body = encoded.slice(4..);
+
+        let decoded = Packet::try_from(&mut body).expect("data packet decodes");
+        match decoded {
+            Packet::Data(data) => {
+                assert_eq!(data.id, 7);
+                assert_eq!(data.data, payload);
+            }
+            other => panic!("unexpected packet: {other:?}"),
         }
     }
 }
