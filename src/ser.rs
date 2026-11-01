@@ -255,8 +255,6 @@ impl SerializeSeq for &mut Serializer {
     }
 }
 
-
-
 impl SerializeMap for &mut Serializer {
     type Ok = ();
     type Error = Error;
